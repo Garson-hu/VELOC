@@ -23,6 +23,12 @@ using axl_module_t = storage_module_t;
 using daos_module_t = storage_module_t;
 #endif
 
+#ifdef WITH_DPU_RELAY
+#include "storage/relay_module.hpp"
+#else
+using relay_module_t = storage_module_t;
+#endif
+
 #include "logger_state.hpp"
 logger_state_t logger_state;
 
@@ -78,6 +84,35 @@ config_t::config_t(const std::string &f, bool is_backend) : cfg_file(f) {
                 sm = new axl_module_t(scratch, persistent, val);
             } else
                 FATAL("AXL requested but not available at compile time, please link with AXL");
+        } else if (get_optional("relay_send_dpu_ip", val)) {
+            if constexpr(!std::is_same<relay_module_t, storage_module_t>::value) {
+                std::string ib_dev, remote_ip, recv_dpu_ip;
+                uint16_t send_dpu_port = 12345, recv_dpu_port = 12346, remote_port = 9999;
+                int tmp;
+                if (!get_optional("relay_ib_dev", ib_dev))
+                    ib_dev = "mlx5_0";
+                if (get_optional("relay_send_dpu_port", tmp))
+                    send_dpu_port = (uint16_t)tmp;
+                get_optional("relay_recv_dpu_ip", recv_dpu_ip);
+                if (get_optional("relay_recv_dpu_port", tmp))
+                    recv_dpu_port = (uint16_t)tmp;
+                get_optional("relay_remote_host_ip", remote_ip);
+                if (get_optional("relay_remote_host_port", tmp))
+                    remote_port = (uint16_t)tmp;
+                if (recv_dpu_ip.empty()) {
+                    INFO("using DPU Relay for persistent storage (send only)");
+                    INFO("  send DPU: " << val << ":" << send_dpu_port);
+                } else {
+                    INFO("using DPU Relay for persistent storage (bidirectional)");
+                    INFO("  send DPU: " << val << ":" << send_dpu_port
+                         << ", recv DPU: " << recv_dpu_ip << ":" << recv_dpu_port);
+                }
+                sm = new relay_module_t(scratch, persistent, ib_dev,
+                                        val, send_dpu_port,
+                                        recv_dpu_ip, recv_dpu_port,
+                                        remote_ip, remote_port);
+            } else
+                FATAL("DPU Relay requested but not available at compile time, please link with relay_bridge");
         } else {
             if (get_bool("aggregated", false)) {
                 INFO("using POSIX to interact with persistent storage in aggregated file mode, path: " << persistent);

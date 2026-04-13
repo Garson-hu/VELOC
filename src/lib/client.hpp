@@ -33,6 +33,7 @@ class client_impl_t : public veloc::client_t {
 
     command_t current_ckpt;
     bool checkpoint_in_progress = false, aggregated = false;
+    bool direct_mem_flushed = false;  // set when relay direct path was used
 
     std::map<int, size_t> region_info;
     size_t header_size = 0;

@@ -62,6 +62,17 @@ if(DAOS_FOUND)
   add_definitions(-DWITH_DAOS)
 endif()
 
+# DPU Relay Bridge
+option(WITH_DPU_RELAY "Enable DPU Relay Bridge storage backend" OFF)
+if(WITH_DPU_RELAY)
+  set(DPU_RELAY_DIR "" CACHE PATH "Path to DPURelayBridge source directory")
+  if(NOT DPU_RELAY_DIR)
+    message(FATAL_ERROR "WITH_DPU_RELAY is ON but DPU_RELAY_DIR is not set. "
+                        "Set it to the DPURelayBridge root, e.g. -DDPU_RELAY_DIR=/path/to/DPURelayBridge")
+  endif()
+  add_definitions(-DWITH_DPU_RELAY)
+endif()
+
 # -----------------------------------------------------------------------------------
 # Main source code
 add_subdirectory(src)

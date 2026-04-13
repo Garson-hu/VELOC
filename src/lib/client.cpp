@@ -13,7 +13,7 @@
 #include <limits.h>
 #include <stdlib.h>
 
-//#define __DEBUG
+#define __DEBUG
 #include "common/debug.hpp"
 
 static inline bool validate_name(const std::string &name) {
@@ -173,6 +173,23 @@ bool client_impl_t::checkpoint_mem(int mode, const std::set<int> &ids) {
 	return false;
     }
 
+    // Direct memory path: bypass scratch file, memcpy into relay ring buffer
+    // Only for regions with raw pointers (not serializer functions) and sync mode
+    if (cfg.is_sync() && cfg.storage() && cfg.storage()->supports_direct_mem()) {
+        bool all_raw = true;
+        for (auto &e : ckpt_regions)
+            if (e.second.ptr == NULL) { all_raw = false; break; }
+        if (all_raw) {
+            std::vector<mem_region_t> regions_vec;
+            for (auto &e : ckpt_regions)
+                regions_vec.push_back({e.first, {e.second.ptr, e.second.size}});
+            DBG("direct memory flush: " << regions_vec.size() << " regions");
+            direct_mem_flushed = cfg.storage()->flush_mem(regions_vec);
+            return direct_mem_flushed;
+        }
+    }
+
+    // Original scratch file path (used for serializer functions or non-relay storage)
     std::ofstream f;
     f.exceptions(std::ofstream::failbit | std::ofstream::badbit);
     try {
@@ -221,6 +238,15 @@ bool client_impl_t::checkpoint_end(bool /*success*/) {
         current_ckpt.offset = offset;
     }
     checkpoint_in_progress = false;
+    // If data was already sent via direct memory path, skip backend transfer.
+    // The data is already on the remote host -- no scratch file to flush.
+    if (direct_mem_flushed) {
+        direct_mem_flushed = false;
+        auto it = observers.find(VELOC_OBSERVE_CKPT_END);
+        if (it != observers.end())
+            it->second(current_ckpt.name, current_ckpt.version);
+        return true;
+    }
     queue->enqueue(current_ckpt);
     auto it = observers.find(VELOC_OBSERVE_CKPT_END);
     if (it != observers.end())
@@ -275,6 +301,14 @@ bool client_impl_t::restart_begin(const std::string &name, int version, int targ
 
     int result, end_result;
     current_ckpt = command_t(check_rank(target_rank), command_t::RESTART, version, name.c_str());
+
+    // Direct memory path: skip backend restore (data will be received in recover_mem)
+    if (cfg.is_sync() && cfg.storage() && cfg.storage()->supports_direct_mem()) {
+        header_size = 0;
+        direct_mem_flushed = true;  // reuse flag to signal direct restore path
+        return true;
+    }
+
     result = run_blocking(current_ckpt);
     if (comm != MPI_COMM_NULL)
 	MPI_Allreduce(&result, &end_result, 1, MPI_INT, MPI_LOR, comm);
@@ -303,11 +337,28 @@ size_t client_impl_t::recover_size(int id) {
 }
 
 bool client_impl_t::recover_mem(int mode, const std::set<int> &ids) {
+    regions_t &ckpt_regions = get_current_ckpt_regions();
+
+    // Direct memory path: receive from relay directly into app memory
+    if (cfg.is_sync() && cfg.storage() && cfg.storage()->supports_direct_mem()
+        && mode == VELOC_CKPT_ALL) {
+        bool all_raw = true;
+        for (auto &e : ckpt_regions)
+            if (e.second.ptr == NULL) { all_raw = false; break; }
+        if (all_raw) {
+            std::vector<mem_region_t> regions_vec;
+            for (auto &e : ckpt_regions)
+                regions_vec.push_back({e.first, {e.second.ptr, e.second.size}});
+            DBG("direct memory restore: " << regions_vec.size() << " regions");
+            return cfg.storage()->restore_mem(regions_vec);
+        }
+    }
+
+    // Original scratch file path
     if (header_size == 0 && !read_current_header()) {
 	ERROR("cannot recover in memory mode if header unavailable or corrupted");
 	return false;
     }
-    regions_t &ckpt_regions = get_current_ckpt_regions();
     try {
 	std::ifstream f;
 	f.exceptions(std::ifstream::failbit | std::ifstream::badbit);
