@@ -17,8 +17,9 @@ relay_module_t::relay_module_t(const std::string &s, const std::string &p,
                                const std::string &ib_devname,
                                const std::string &send_dpu_ip, uint16_t send_dpu_port,
                                const std::string &recv_dpu_ip, uint16_t recv_dpu_port,
-                               const std::string &remote_host_ip, uint16_t remote_host_port)
-    : posix_module_t(s, p)
+                               const std::string &remote_host_ip, uint16_t remote_host_port,
+                               bool async_mode)
+    : posix_module_t(s, p), async_mode(async_mode)
 {
     // --- sender bridge (this host -> remote host) ---
     relay_bridge::Config send_cfg;
@@ -215,15 +216,28 @@ bool relay_module_t::flush_mem(const std::vector<mem_region_t> &regions) {
             // Zero-copy: write directly from app memory into ring buffer slot
             size_t capacity = 0;
             void *slot = send_bridge.get_write_slot(&capacity);
+            if (!slot && async_mode) {
+                // Ring full — flush in-flight slots and retry
+                send_bridge.flush();
+                slot = send_bridge.get_write_slot(&capacity);
+            }
             if (!slot) {
                 ERROR("relay ring buffer full");
                 return false;
             }
             memcpy(slot, src, chunk);
-            auto s = send_bridge.commit_slot(chunk);
-            if (s != relay_bridge::Status::OK) {
-                ERROR("RelayBridge commit_slot failed: " << relay_bridge::status_string(s));
-                return false;
+            if (async_mode) {
+                auto s = send_bridge.commit_slot_async(chunk);
+                if (s != relay_bridge::Status::OK) {
+                    ERROR("RelayBridge commit_slot_async failed: " << relay_bridge::status_string(s));
+                    return false;
+                }
+            } else {
+                auto s = send_bridge.commit_slot(chunk);
+                if (s != relay_bridge::Status::OK) {
+                    ERROR("RelayBridge commit_slot failed: " << relay_bridge::status_string(s));
+                    return false;
+                }
             }
 
             src += chunk;
@@ -231,6 +245,11 @@ bool relay_module_t::flush_mem(const std::vector<mem_region_t> &regions) {
         }
         total_bytes += size;
     }
+
+    // In async mode, return immediately after submitting all slots. The relay's
+    // background drain thread collects completions; the next flush_mem call
+    // auto-backpressures via get_write_slot when the ring is full. This lets
+    // the caller overlap compute with RDMA transfer.
 
     TIMER_STOP(io_timer, "relay-flush-mem " << regions.size()
                << " regions (" << total_bytes << " bytes)");

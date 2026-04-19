@@ -107,10 +107,14 @@ config_t::config_t(const std::string &f, bool is_backend) : cfg_file(f) {
                     INFO("  send DPU: " << val << ":" << send_dpu_port
                          << ", recv DPU: " << recv_dpu_ip << ":" << recv_dpu_port);
                 }
+                bool relay_async = get_bool("relay_async", false);
+                if (relay_async)
+                    INFO("  async relay mode enabled");
                 sm = new relay_module_t(scratch, persistent, ib_dev,
                                         val, send_dpu_port,
                                         recv_dpu_ip, recv_dpu_port,
-                                        remote_ip, remote_port);
+                                        remote_ip, remote_port,
+                                        relay_async);
             } else
                 FATAL("DPU Relay requested but not available at compile time, please link with relay_bridge");
         } else {

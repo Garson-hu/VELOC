@@ -10,6 +10,7 @@ class relay_module_t : public posix_module_t {
     relay_bridge::RelayBridge recv_bridge;
     bool send_connected = false;
     bool recv_connected = false;
+    bool async_mode = false;
 
     bool relay_send_file(const std::string &source);
     bool relay_recv_file(const std::string &dest);
@@ -19,7 +20,8 @@ public:
                    const std::string &ib_devname,
                    const std::string &send_dpu_ip, uint16_t send_dpu_port,
                    const std::string &recv_dpu_ip, uint16_t recv_dpu_port,
-                   const std::string &remote_host_ip, uint16_t remote_host_port);
+                   const std::string &remote_host_ip, uint16_t remote_host_port,
+                   bool async_mode = false);
     virtual ~relay_module_t();
     virtual bool flush(const command_t &cmd);
     virtual bool restore(const command_t &cmd);

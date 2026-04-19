@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: VELOC-Python
+Version: 0.1
+Summary: VELOC Python Bindings
+Home-page: https://veloc.rtfd.io/
+Author: VELOC team
+Author-email: bogdan.nicolae@acm.org
+Dynamic: author
+Dynamic: author-email
+Dynamic: home-page
+Dynamic: summary

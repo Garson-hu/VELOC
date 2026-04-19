@@ -127,11 +127,16 @@ int main(int argc, char *argv[]) {
         if (globalerror < PRECISION)
 	    break;
 	i++;
-	if (i % CKPT_FREQ == 0)
+	if (i % CKPT_FREQ == 0) {
+	    double ckpt_t0 = MPI_Wtime();
 	    if (VELOC_Checkpoint("heatdis", i) != VELOC_SUCCESS) {
                 printf("Error checkpointing! Aborting...\n");
                 exit(2);
             }
+	    double ckpt_t1 = MPI_Wtime();
+	    if (rank == 0)
+		printf("[ckpt] iter=%d stall=%.4f s\n", i, ckpt_t1 - ckpt_t0);
+	}
     }
     if (rank == 0)
 	printf("Execution finished in %lf seconds.\n", MPI_Wtime() - wtime);

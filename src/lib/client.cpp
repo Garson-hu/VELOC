@@ -173,9 +173,11 @@ bool client_impl_t::checkpoint_mem(int mode, const std::set<int> &ids) {
 	return false;
     }
 
-    // Direct memory path: bypass scratch file, memcpy into relay ring buffer
-    // Only for regions with raw pointers (not serializer functions) and sync mode
-    if (cfg.is_sync() && cfg.storage() && cfg.storage()->supports_direct_mem()) {
+    // Direct memory path: bypass scratch file, memcpy into relay ring buffer.
+    // Works for raw-pointer regions in both sync and async mode. In async mode
+    // the storage module submits slots without waiting, so checkpoint_end
+    // returns while RDMA drains in the background.
+    if (cfg.storage() && cfg.storage()->supports_direct_mem()) {
         bool all_raw = true;
         for (auto &e : ckpt_regions)
             if (e.second.ptr == NULL) { all_raw = false; break; }
