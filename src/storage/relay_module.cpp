@@ -57,6 +57,8 @@ relay_module_t::relay_module_t(const std::string &s, const std::string &p,
 
 relay_module_t::~relay_module_t() {
     if (send_connected) {
+        if (async_mode)
+            send_bridge.flush();
         send_bridge.disconnect();
         send_connected = false;
     }
