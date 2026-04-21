@@ -13,6 +13,7 @@ class relay_module_t : public posix_module_t {
     bool send_connected = false;
     bool recv_connected = false;
     bool async_mode = false;
+    bool use_register_once = true;
 
     // Register-once cache keyed by VELOC region id. On first flush_mem for an
     // id we pay create_cgmk_mkey + NEW_REGION_DESC; subsequent checkpoints hit
@@ -38,7 +39,8 @@ public:
                    const std::string &send_dpu_ip, uint16_t send_dpu_port,
                    const std::string &recv_dpu_ip, uint16_t recv_dpu_port,
                    const std::string &remote_host_ip, uint16_t remote_host_port,
-                   bool async_mode = false);
+                   bool async_mode = false,
+                   bool use_register_once = true);
     virtual ~relay_module_t();
     virtual bool flush(const command_t &cmd);
     virtual bool restore(const command_t &cmd);

@@ -18,8 +18,8 @@ relay_module_t::relay_module_t(const std::string &s, const std::string &p,
                                const std::string &send_dpu_ip, uint16_t send_dpu_port,
                                const std::string &recv_dpu_ip, uint16_t recv_dpu_port,
                                const std::string &remote_host_ip, uint16_t remote_host_port,
-                               bool async_mode)
-    : posix_module_t(s, p), async_mode(async_mode)
+                               bool async_mode, bool use_register_once)
+    : posix_module_t(s, p), async_mode(async_mode), use_register_once(use_register_once)
 {
     // --- sender bridge (this host -> remote host) ---
     relay_bridge::Config send_cfg;
@@ -227,11 +227,12 @@ bool relay_module_t::flush_mem(const std::vector<mem_region_t> &regions) {
         return false;
     }
 
-    // Sync mode: register-once per region. DPU pulls directly from app memory
-    // via cross-GVMI alias; no app→slot memcpy on the hot path. Async mode
-    // keeps the memcpy path because transfer() internally flushes.
+    // Sync mode + register-once enabled: DPU pulls directly from app memory
+    // via cross-GVMI alias; no app→slot memcpy on the hot path. Async mode or
+    // when register-once is disabled via relay_use_register_once=false in the
+    // config, we fall through to the memcpy path for A/B comparison.
     size_t total_bytes = 0;
-    if (!async_mode) {
+    if (!async_mode && use_register_once) {
         for (auto &r : regions) {
             int    id   = r.first;
             void  *ptr  = r.second.first;
@@ -256,7 +257,7 @@ bool relay_module_t::flush_mem(const std::vector<mem_region_t> &regions) {
         return true;
     }
 
-    // Async memcpy-into-slot path (async mode).
+    // Memcpy-into-slot path (async mode, or register-once disabled).
     for (auto &r : regions) {
         void *ptr   = r.second.first;
         size_t size = r.second.second;
@@ -299,7 +300,7 @@ bool relay_module_t::flush_mem(const std::vector<mem_region_t> &regions) {
     // auto-backpressures via get_write_slot when the ring is full. This lets
     // the caller overlap compute with RDMA transfer.
 
-    TIMER_STOP(io_timer, "relay-flush-mem " << regions.size()
+    TIMER_STOP(io_timer, "relay-flush-mem-memcpy " << regions.size()
                << " regions (" << total_bytes << " bytes)");
     return true;
 }
