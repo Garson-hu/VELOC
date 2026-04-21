@@ -59,6 +59,7 @@ relay_module_t::~relay_module_t() {
     if (send_connected) {
         if (async_mode)
             send_bridge.flush();
+        unregister_all_regions();
         send_bridge.disconnect();
         send_connected = false;
     }
@@ -66,6 +67,31 @@ relay_module_t::~relay_module_t() {
         recv_bridge.disconnect();
         recv_connected = false;
     }
+}
+
+bool relay_module_t::ensure_region_registered(int id, void *ptr, size_t size,
+                                              relay_bridge::RegionHandle &out) {
+    auto it = region_cache.find(id);
+    if (it != region_cache.end()) {
+        if (it->second.ptr == ptr && it->second.size == size) {
+            out = it->second.handle;
+            return true;
+        }
+        send_bridge.unregister_region(it->second.handle);
+        region_cache.erase(it);
+    }
+    relay_bridge::RegionHandle h = send_bridge.register_region(ptr, size);
+    if (!h.valid())
+        return false;
+    region_cache[id] = { h, ptr, size };
+    out = h;
+    return true;
+}
+
+void relay_module_t::unregister_all_regions() {
+    for (auto &kv : region_cache)
+        send_bridge.unregister_region(kv.second.handle);
+    region_cache.clear();
 }
 
 bool relay_module_t::relay_send_file(const std::string &source) {
@@ -201,8 +227,36 @@ bool relay_module_t::flush_mem(const std::vector<mem_region_t> &regions) {
         return false;
     }
 
-    // Send each region's data directly from application memory
+    // Sync mode: register-once per region. DPU pulls directly from app memory
+    // via cross-GVMI alias; no app→slot memcpy on the hot path. Async mode
+    // keeps the memcpy path because transfer() internally flushes.
     size_t total_bytes = 0;
+    if (!async_mode) {
+        for (auto &r : regions) {
+            int    id   = r.first;
+            void  *ptr  = r.second.first;
+            size_t size = r.second.second;
+            if (ptr == NULL || size == 0)
+                continue;
+            relay_bridge::RegionHandle h;
+            if (!ensure_region_registered(id, ptr, size, h)) {
+                ERROR("RelayBridge register_region failed for id=" << id);
+                return false;
+            }
+            auto s = send_bridge.transfer(h, 0, size);
+            if (s != relay_bridge::Status::OK) {
+                ERROR("RelayBridge transfer failed for id=" << id
+                      << ": " << relay_bridge::status_string(s));
+                return false;
+            }
+            total_bytes += size;
+        }
+        TIMER_STOP(io_timer, "relay-flush-mem-registered " << regions.size()
+                   << " regions (" << total_bytes << " bytes)");
+        return true;
+    }
+
+    // Async memcpy-into-slot path (async mode).
     for (auto &r : regions) {
         void *ptr   = r.second.first;
         size_t size = r.second.second;
@@ -218,7 +272,7 @@ bool relay_module_t::flush_mem(const std::vector<mem_region_t> &regions) {
             // Zero-copy: write directly from app memory into ring buffer slot
             size_t capacity = 0;
             void *slot = send_bridge.get_write_slot(&capacity);
-            if (!slot && async_mode) {
+            if (!slot) {
                 // Ring full — flush in-flight slots and retry
                 send_bridge.flush();
                 slot = send_bridge.get_write_slot(&capacity);
@@ -228,18 +282,10 @@ bool relay_module_t::flush_mem(const std::vector<mem_region_t> &regions) {
                 return false;
             }
             memcpy(slot, src, chunk);
-            if (async_mode) {
-                auto s = send_bridge.commit_slot_async(chunk);
-                if (s != relay_bridge::Status::OK) {
-                    ERROR("RelayBridge commit_slot_async failed: " << relay_bridge::status_string(s));
-                    return false;
-                }
-            } else {
-                auto s = send_bridge.commit_slot(chunk);
-                if (s != relay_bridge::Status::OK) {
-                    ERROR("RelayBridge commit_slot failed: " << relay_bridge::status_string(s));
-                    return false;
-                }
+            auto s = send_bridge.commit_slot_async(chunk);
+            if (s != relay_bridge::Status::OK) {
+                ERROR("RelayBridge commit_slot_async failed: " << relay_bridge::status_string(s));
+                return false;
             }
 
             src += chunk;

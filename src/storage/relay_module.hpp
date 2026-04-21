@@ -4,6 +4,8 @@
 #include "posix_module.hpp"
 #include "relay_bridge.h"
 
+#include <map>
+
 class relay_module_t : public posix_module_t {
     // Bidirectional: one bridge for sending (flush), one for receiving (restore)
     relay_bridge::RelayBridge send_bridge;
@@ -12,8 +14,23 @@ class relay_module_t : public posix_module_t {
     bool recv_connected = false;
     bool async_mode = false;
 
+    // Register-once cache keyed by VELOC region id. On first flush_mem for an
+    // id we pay create_cgmk_mkey + NEW_REGION_DESC; subsequent checkpoints hit
+    // the hot path with zero mkey work. If the app re-protects the id with a
+    // different (ptr, size), we retire the old alias and re-register.
+    struct region_cache_entry_t {
+        relay_bridge::RegionHandle handle;
+        void  *ptr;
+        size_t size;
+    };
+    std::map<int, region_cache_entry_t> region_cache;
+
     bool relay_send_file(const std::string &source);
     bool relay_recv_file(const std::string &dest);
+
+    bool ensure_region_registered(int id, void *ptr, size_t size,
+                                  relay_bridge::RegionHandle &out);
+    void unregister_all_regions();
 
 public:
     relay_module_t(const std::string &scratch, const std::string &persistent,
