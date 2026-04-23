@@ -295,10 +295,18 @@ bool relay_module_t::flush_mem(const std::vector<mem_region_t> &regions) {
         total_bytes += size;
     }
 
-    // In async mode, return immediately after submitting all slots. The relay's
-    // background drain thread collects completions; the next flush_mem call
-    // auto-backpressures via get_write_slot when the ring is full. This lets
-    // the caller overlap compute with RDMA transfer.
+    // Drain pending async slots before returning so that the next flush_mem
+    // call starts with an empty ring. Without this, cross-iteration ring
+    // pressure from prior commit_slot_async calls makes send(header) return
+    // ERR_RING_FULL once the ring saturates (observed at ≥512 MB checkpoints
+    // with 32 slots).
+    if (!async_mode) {
+        auto fs = send_bridge.flush();
+        if (fs != relay_bridge::Status::OK) {
+            ERROR("RelayBridge flush failed: " << relay_bridge::status_string(fs));
+            return false;
+        }
+    }
 
     TIMER_STOP(io_timer, "relay-flush-mem-memcpy " << regions.size()
                << " regions (" << total_bytes << " bytes)");
