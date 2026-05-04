@@ -18,8 +18,11 @@ relay_module_t::relay_module_t(const std::string &s, const std::string &p,
                                const std::string &send_dpu_ip, uint16_t send_dpu_port,
                                const std::string &recv_dpu_ip, uint16_t recv_dpu_port,
                                const std::string &remote_host_ip, uint16_t remote_host_port,
-                               bool async_mode, bool use_register_once)
-    : posix_module_t(s, p), async_mode(async_mode), use_register_once(use_register_once)
+                               bool async_mode, bool use_register_once,
+                               bool use_adapter_staging)
+    : posix_module_t(s, p), async_mode(async_mode),
+      use_register_once(use_register_once),
+      use_adapter_staging(use_adapter_staging)
 {
     // --- sender bridge (this host -> remote host) ---
     relay_bridge::Config send_cfg;
@@ -60,6 +63,10 @@ relay_module_t::~relay_module_t() {
         if (async_mode)
             send_bridge.flush();
         unregister_all_regions();
+        if (adapter_staging_registered) {
+            send_bridge.unregister_region(adapter_staging_handle);
+            adapter_staging_registered = false;
+        }
         send_bridge.disconnect();
         send_connected = false;
     }
@@ -67,6 +74,52 @@ relay_module_t::~relay_module_t() {
         recv_bridge.disconnect();
         recv_connected = false;
     }
+    if (adapter_staging_buf) {
+        free(adapter_staging_buf);
+        adapter_staging_buf = nullptr;
+        adapter_staging_size = 0;
+    }
+}
+
+bool relay_module_t::ensure_adapter_staging(size_t min_bytes) {
+    // Grow with 25% headroom so steady-state usage doesn't thrash dereg/realloc.
+    if (adapter_staging_buf && adapter_staging_size >= min_bytes)
+        return true;
+
+    size_t new_size = (min_bytes * 5) / 4;
+    // Page-align so posix_memalign succeeds and the bridge sees a clean page boundary.
+    long page = sysconf(_SC_PAGESIZE);
+    if (new_size % page) new_size += (page - new_size % page);
+
+    if (adapter_staging_registered) {
+        send_bridge.unregister_region(adapter_staging_handle);
+        adapter_staging_registered = false;
+    }
+    if (adapter_staging_buf) {
+        free(adapter_staging_buf);
+        adapter_staging_buf = nullptr;
+        adapter_staging_size = 0;
+    }
+
+    if (posix_memalign(&adapter_staging_buf, page, new_size) != 0) {
+        ERROR("adapter staging posix_memalign(" << new_size << ") failed");
+        adapter_staging_buf = nullptr;
+        return false;
+    }
+    adapter_staging_size = new_size;
+
+    auto h = send_bridge.register_region(adapter_staging_buf, adapter_staging_size);
+    if (!h.valid()) {
+        ERROR("adapter staging register_region(" << adapter_staging_size << ") failed");
+        free(adapter_staging_buf);
+        adapter_staging_buf = nullptr;
+        adapter_staging_size = 0;
+        return false;
+    }
+    adapter_staging_handle = h;
+    adapter_staging_registered = true;
+    INFO("adapter staging buffer (re)allocated: " << adapter_staging_size << " bytes");
+    return true;
 }
 
 bool relay_module_t::ensure_region_registered(int id, void *ptr, size_t size,
@@ -232,7 +285,60 @@ bool relay_module_t::flush_mem(const std::vector<mem_region_t> &regions) {
     // when register-once is disabled via relay_use_register_once=false in the
     // config, we fall through to the memcpy path for A/B comparison.
     size_t total_bytes = 0;
+    if (!async_mode && use_register_once && use_adapter_staging) {
+        // Adapter-staging unification: copy every region into ONE big pinned
+        // staging buffer registered once with the bridge, then issue a single
+        // bridge.transfer over that buffer. The host pays one memcpy per
+        // region (~10 GB/s on Xeon), but the DPU sees ONE region instead of
+        // N — the per-region MMO setup cost (which transfer_batch could not
+        // amortise away) collapses to a single setup. Single-region apps
+        // see no change; the staging copy is only beneficial when there are
+        // multiple regions whose per-region DPU setup cost dominates the
+        // host memcpy overhead.
+        size_t needed = 0;
+        for (auto &r : regions) {
+            if (r.second.first && r.second.second)
+                needed += r.second.second;
+        }
+        if (!ensure_adapter_staging(needed)) {
+            ERROR("ensure_adapter_staging(" << needed << ") failed");
+            return false;
+        }
+        size_t off = 0;
+        for (auto &r : regions) {
+            void  *ptr  = r.second.first;
+            size_t size = r.second.second;
+            if (ptr == NULL || size == 0)
+                continue;
+            memcpy((char*)adapter_staging_buf + off, ptr, size);
+            off += size;
+        }
+        total_bytes = off;
+        if (total_bytes > 0) {
+            auto s = send_bridge.transfer(adapter_staging_handle, 0, total_bytes);
+            if (s != relay_bridge::Status::OK) {
+                ERROR("RelayBridge transfer (adapter-staging) failed: "
+                      << relay_bridge::status_string(s));
+                return false;
+            }
+        }
+        TIMER_STOP(io_timer, "relay-flush-mem-adapter-staging " << regions.size()
+                   << " regions (" << total_bytes << " bytes)");
+        return true;
+    }
+
     if (!async_mode && use_register_once) {
+        // Build batch of (handle, offset=0, size) for all live regions and
+        // hand the whole vector to transfer_batch(). One flush() at the end
+        // keeps the relay pipeline fed across regions; per-region transfer()
+        // would drain the pipeline between each call (≥10% loss on CoMD's
+        // 7-region checkpoint).
+        std::vector<relay_bridge::RegionHandle> handles;
+        std::vector<size_t> offsets;
+        std::vector<size_t> sizes;
+        handles.reserve(regions.size());
+        offsets.reserve(regions.size());
+        sizes.reserve(regions.size());
         for (auto &r : regions) {
             int    id   = r.first;
             void  *ptr  = r.second.first;
@@ -244,13 +350,18 @@ bool relay_module_t::flush_mem(const std::vector<mem_region_t> &regions) {
                 ERROR("RelayBridge register_region failed for id=" << id);
                 return false;
             }
-            auto s = send_bridge.transfer(h, 0, size);
+            handles.push_back(h);
+            offsets.push_back(0);
+            sizes.push_back(size);
+            total_bytes += size;
+        }
+        if (!handles.empty()) {
+            auto s = send_bridge.transfer_batch(handles, offsets, sizes);
             if (s != relay_bridge::Status::OK) {
-                ERROR("RelayBridge transfer failed for id=" << id
-                      << ": " << relay_bridge::status_string(s));
+                ERROR("RelayBridge transfer_batch failed: "
+                      << relay_bridge::status_string(s));
                 return false;
             }
-            total_bytes += size;
         }
         TIMER_STOP(io_timer, "relay-flush-mem-registered " << regions.size()
                    << " regions (" << total_bytes << " bytes)");

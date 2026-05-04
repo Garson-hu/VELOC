@@ -113,11 +113,15 @@ config_t::config_t(const std::string &f, bool is_backend) : cfg_file(f) {
                 bool relay_register_once = get_bool("relay_use_register_once", true);
                 if (!relay_register_once)
                     INFO("  register-once DISABLED (memcpy path forced)");
+                bool relay_adapter_staging = get_bool("relay_use_adapter_staging", false);
+                if (relay_adapter_staging)
+                    INFO("  adapter-staging unification ENABLED (multi-region collapses to single transfer)");
                 sm = new relay_module_t(scratch, persistent, ib_dev,
                                         val, send_dpu_port,
                                         recv_dpu_ip, recv_dpu_port,
                                         remote_ip, remote_port,
-                                        relay_async, relay_register_once);
+                                        relay_async, relay_register_once,
+                                        relay_adapter_staging);
             } else
                 FATAL("DPU Relay requested but not available at compile time, please link with relay_bridge");
         } else {
